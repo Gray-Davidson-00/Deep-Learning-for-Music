@@ -1,0 +1,174 @@
+""" This module generates notes for a midi file using the
+    trained neural network """
+import pickle
+import numpy as np
+from music21 import instrument, note, stream, chord
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.layers import Dropout
+from keras.layers import LSTM
+from keras.layers import Activation
+from keras.layers import CuDNNLSTM
+from keras.layers import Embedding
+
+from gensim.models import Word2Vec
+from gensim import models
+
+
+def generate():
+    """ Generate a piano midi file """
+    # load the notes used to train the model
+    with open('data/notes', 'rb') as filepath:
+        notes = pickle.load(filepath)
+
+    # Get all pitch names
+    pitchnames = sorted(set(item for item in notes))
+    # Get all pitch names
+    n_vocab = 60  # len(set(notes))
+
+    network_input, normalized_input, note_to_int = prepare_sequences(notes, pitchnames, n_vocab)
+    embedding_weights = create_embedding(n_vocab, note_to_int)
+
+    model = create_network(normalized_input, n_vocab, embedding_weights)
+    prediction_output = generate_notes(model, network_input, pitchnames, n_vocab)
+    create_midi(prediction_output)
+
+
+def prepare_sequences(notes, pitchnames, n_vocab):
+    """ Prepare the sequences used by the Neural Network """
+    # map between notes and integers and back
+    note_to_int = dict((note, number) for number, note in enumerate(pitchnames))
+
+    sequence_length = 100
+    network_input = []
+    output = []
+    for i in range(0, len(notes) - sequence_length, 1):
+        sequence_in = notes[i:i + sequence_length]
+        sequence_out = notes[i + sequence_length]
+        network_input.append([note_to_int[char] for char in sequence_in])
+        output.append(note_to_int[sequence_out])
+
+    n_patterns = len(network_input)
+
+    # reshape the input into a format compatible with LSTM layers
+    normalized_input = np.reshape(network_input, (n_patterns, sequence_length, 1))
+    # normalize input
+    normalized_input = normalized_input / float(n_vocab)
+
+    return (network_input, normalized_input, note_to_int)
+
+
+def create_embedding(n_vocab, note_to_int):
+    """
+    :Purpose: create an embedding from a set of text data, Save the embedding as a correctly named model
+
+
+    :param data_folder: a string which is a path to a folder where text is stored.
+    :type data_folder: string
+
+    :param filename: the sub_folder containing a particular author's works. 
+    :type filename: string
+
+    :return: returns a gensim embedding layer which represents every distinct word in a corpus as a vector of length "size" 
+    :return type: gensim.models.word2vec.Word2Vec
+    """
+    print("Creating Embedding:")
+    embedding = Word2Vec.load('music_embedding.bin')
+    embedding_weights = np.zeros((n_vocab, 150))
+    for note, index in note_to_int.items():
+        embedding_weights[index, :] = embedding[note] if note in embedding else np.random.rand(150)
+    return embedding_weights
+
+
+def create_network(network_input, n_vocab, embedding_weights):
+    """ create the structure of the neural network """
+    print("Creating Network:")
+    model = Sequential()
+    # model.add inut layer
+    model.add(Embedding(input_dim=n_vocab,
+                        output_dim=150,
+                        input_length=network_input.shape[1],
+                        trainable=False,
+                        weights=[embedding_weights]))
+    model.add(CuDNNLSTM(
+        128,
+        input_shape=(network_input.shape[1], 1)
+        # return_sequences=True
+
+    ))
+    model.add(Dropout(0.3))
+    model.add(Dense(n_vocab))
+    model.add(Activation('softmax'))
+    model.compile(loss='categorical_crossentropy', optimizer='rmsprop')
+
+    # Load the weights to each node
+    model.load_weights('weights-improvement-196-3.1424-bigger.hdf5')
+
+    return model
+
+
+def generate_notes(model, network_input, pitchnames, n_vocab):
+    """ Generate notes from the neural network based on a sequence of notes """
+    # pick a random sequence from the input as a starting point for the prediction
+    start = np.random.randint(0, len(network_input) - 1)
+
+    int_to_note = dict((number, note) for number, note in enumerate(pitchnames))
+
+    pattern = network_input[start]
+    prediction_output = []
+
+    # generate 500 notes
+    for note_index in range(500):
+        prediction_input = np.reshape(pattern, (1, len(pattern)))
+        prediction_input = prediction_input / float(n_vocab)
+
+        prediction = model.predict(prediction_input, verbose=0)
+
+        index = np.argmax(prediction)
+        result = int_to_note[index]
+        prediction_output.append(result)
+
+        pattern.append(index)
+        pattern = pattern[1:len(pattern)]
+
+    return prediction_output
+
+
+def create_midi(prediction_output):
+    """ convert the output from the prediction to notes and create a midi file
+        from the notes """
+    for i in range(1, 11):
+        offset = 0
+        output_notes = []
+
+        # create note and chord objects based on the values generated by the model
+        for pattern in prediction_output:
+            # pattern is a chord
+            if ('.' in pattern) or pattern.isdigit():
+                notes_in_chord = pattern.split('.')
+                notes = []
+                for current_note in notes_in_chord:
+                    new_note = note.Note(int(current_note))
+                    new_note.storedInstrument = instrument.Piano()
+                    notes.append(new_note)
+                new_chord = chord.Chord(notes)
+                new_chord.offset = offset
+                output_notes.append(new_chord)
+            # pattern is a note
+            else:
+                new_note = note.Note(pattern)
+                new_note.offset = offset
+                new_note.storedInstrument = instrument.Piano()
+                output_notes.append(new_note)
+
+            # increase offset each iteration so that notes do not stack
+            offset += 0.5
+
+        midi_stream = stream.Stream(output_notes)
+
+        #    midi_stream.write('midi', fp='Generation 2 (Embedding)/test_output'+str(i)+'.mid')
+        midi_stream.write('midi', fp='test_output.mid')
+
+
+if __name__ == '__main__':
+    generate()
